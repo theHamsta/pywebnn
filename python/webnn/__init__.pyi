@@ -1,6 +1,7 @@
 """Type stubs for webnn package"""
 
 from typing import Any, Dict, List, Optional, Union
+import os
 import numpy as np
 import numpy.typing as npt
 
@@ -243,6 +244,19 @@ class MLGraphBuilder:
     """Builder for constructing WebNN computational graphs"""
 
     def __init__(self) -> None: ...
+
+    @staticmethod
+    def new_uncompiled() -> MLGraphBuilder:
+        """Construct a builder without a runtime; build() returns an uncompiled graph."""
+        ...
+
+    def rustnn_webnn_text_for_outputs(self, outputs: Dict[str, MLOperand]) -> str:
+        """RustNN text serialization with inline constants, before or after build()."""
+        ...
+
+    def rustnn_save_webnn(self, outputs: Dict[str, MLOperand], path: Union[str, "os.PathLike[str]"]) -> None:
+        """Write RustNN text and <stem>.safetensors without consuming the builder."""
+        ...
 
     def input(
         self,

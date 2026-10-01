@@ -1202,3 +1202,34 @@ Common exceptions:
 - `ValueError`: Invalid graph structure or parameters
 - `IOError`: File I/O errors
 - `RuntimeError`: Conversion or execution failures
+
+## RustNN builder text export
+
+Use a backend-free builder when you only need to construct and export a network:
+
+```python
+import webnn
+
+builder = webnn.MLGraphBuilder.new_uncompiled()
+x = builder.input("x", [2, 3], "float32")
+y = builder.relu(x)
+outputs = {"y": y}
+
+graph = builder.build(outputs)  # records an uncompiled MLGraph
+text = builder.rustnn_webnn_text_for_outputs(outputs)
+builder.rustnn_save_webnn(outputs, "model.webnn")
+```
+
+`rustnn_webnn_text_for_outputs(outputs) -> str` delegates to RustNN's text
+serializer and embeds constants inline. `rustnn_save_webnn(outputs, path)`
+delegates to RustNN's saver, writing the text file and a sibling
+`<stem>.safetensors` containing external constant weights. Both methods work
+before or after `build()` and leave the recorded graph unchanged. Empty,
+duplicate, invalid, or conflicting outputs raise an exception.
+
+`new_uncompiled()` initializes no backend and needs no runtime shared library.
+Its graph can later be executed by a context. Context-created builders expose
+the same serialization methods and retain their existing compilation behavior.
+The Python builder's recorded operations are replayed through
+`MLGraphBuilder::new_uncompiled()` for serialization, so RustNN owns shape
+validation, text formatting, and weight-file handling.

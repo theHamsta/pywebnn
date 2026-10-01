@@ -183,7 +183,7 @@ fn clamp_limits_ordered(
 }
 #[pyclass(name = "MLGraphBuilder")]
 pub struct PyMLGraphBuilder {
-    context: Py<super::context::PyMLContext>,
+    context: Option<Py<super::context::PyMLContext>>,
     built: bool,
     operands: Vec<Operand>,
     operations: Vec<Operation>,
@@ -3068,6 +3068,57 @@ impl PyMLGraphBuilder {
         Ok(py_operand)
     }
 
+    /// Create a graph recorder without initializing a runtime backend.
+    /// build() returns an uncompiled MLGraph; a context can dispatch it later.
+    #[staticmethod]
+    fn new_uncompiled() -> Self {
+        Self {
+            context: None,
+            built: false,
+            operands: Vec::new(),
+            operations: Vec::new(),
+            input_operands: Vec::new(),
+            next_operand_id: 0,
+            operand_map: HashMap::new(),
+            constant_data_map: HashMap::new(),
+        }
+    }
+
+    /// Serialize the recorded graph through RustNN, with constants inline.
+    /// Does not consume the builder; also works after build().
+    fn rustnn_webnn_text_for_outputs(&self, outputs: &Bound<'_, PyDict>) -> PyResult<String> {
+        let owned = self.named_outputs(outputs)?;
+        let named = owned
+            .iter()
+            .map(|(name, operand)| (name.as_str(), *operand))
+            .collect();
+        let builder = self.recorded_rustnn_builder()?;
+        builder
+            .rustnn_webnn_text_for_outputs(&named)
+            .ok_or_else(|| {
+                pyo3::exceptions::PyValueError::new_err(
+                    "RustNN could not serialize the named graph outputs",
+                )
+            })
+    }
+
+    /// Save .webnn text and a sibling .safetensors file through RustNN.
+    /// Does not consume the builder; also works after build().
+    fn rustnn_save_webnn(
+        &self,
+        outputs: &Bound<'_, PyDict>,
+        path: std::path::PathBuf,
+    ) -> PyResult<()> {
+        let owned = self.named_outputs(outputs)?;
+        let named = owned
+            .iter()
+            .map(|(name, operand)| (name.as_str(), *operand))
+            .collect();
+        self.recorded_rustnn_builder()?
+            .rustnn_save_webnn(&named, path)
+            .map_err(super::context_state::map_rustnn_error)
+    }
+
     /// Build the computational graph
     ///
     /// Args:
@@ -3123,18 +3174,19 @@ impl PyMLGraphBuilder {
         }
         self.built = true;
 
-        let graph_slot = {
-            self.context
+        if let Some(context) = &self.context {
+            let graph_slot = context
                 .bind(py)
                 .borrow()
-                .compile_graph(graph_info.clone())?
-        };
-
-        Ok(PyMLGraph::new_compiled(
-            graph_info,
-            self.context.clone_ref(py),
-            graph_slot,
-        ))
+                .compile_graph(graph_info.clone())?;
+            Ok(PyMLGraph::new_compiled(
+                graph_info,
+                context.clone_ref(py),
+                graph_slot,
+            ))
+        } else {
+            Ok(PyMLGraph::new(graph_info))
+        }
     }
 
     /// Scatter elements operation
@@ -4164,6 +4216,124 @@ impl PyMLGraphBuilder {
 }
 
 impl PyMLGraphBuilder {
+    fn named_outputs(
+        &self,
+        outputs: &Bound<'_, PyDict>,
+    ) -> PyResult<std::collections::BTreeMap<String, rustnn::mlcontext::MLOperand>> {
+        use pyo3::exceptions::PyValueError;
+        let mut named = std::collections::BTreeMap::new();
+        if outputs.is_empty() {
+            return Err(PyValueError::new_err("Graph outputs must not be empty"));
+        }
+        let mut ids = std::collections::HashSet::new();
+        for (name, value) in outputs.iter() {
+            let name: String = name.extract()?;
+            let operand: PyMLOperand = value.extract()?;
+            let recorded = self.operand_map.get(&operand.id).ok_or_else(|| {
+                PyValueError::new_err(format!("Unknown output operand {}", operand.id))
+            })?;
+            if (recorded.descriptor.data_type != operand.descriptor.data_type
+                || recorded.descriptor.shape != operand.descriptor.shape)
+                || !ids.insert(operand.id)
+            {
+                return Err(PyValueError::new_err(
+                    "Invalid or duplicate graph output operand",
+                ));
+            }
+            named.insert(name, rustnn::mlcontext::MLOperand::from(operand.id));
+        }
+        Ok(named)
+    }
+
+    /// Python historically recorded GraphInfo itself. Replay it in insertion order
+    /// through the Rust builder API so RustNN owns text and sidecar serialization.
+    fn recorded_rustnn_builder(
+        &self,
+    ) -> PyResult<rustnn::mlcontext::MLGraphBuilder<'static, 'static>> {
+        use pyo3::exceptions::PyValueError;
+        use rustnn::mlcontext::{MLGraphBuilder, MLOperandDescriptor};
+        let mut builder = MLGraphBuilder::new_uncompiled();
+        let mut next_id = 0;
+        let mut operations = self.operations.iter();
+        while next_id < self.operands.len() {
+            let recorded = &self.operands[next_id];
+            let descriptor = MLOperandDescriptor::new(
+                MLOperandDataType::try_from(recorded.descriptor.data_type)
+                    .map_err(|e| super::context_state::map_rustnn_error(e.into()))?,
+                recorded
+                    .descriptor
+                    .static_or_max_shape()
+                    .into_iter()
+                    .map(u64::from)
+                    .collect(),
+            );
+            let ids = match recorded.kind {
+                OperandKind::Input => vec![builder
+                    .input(recorded.name.as_deref().unwrap_or(""), &descriptor)
+                    .map_err(super::context_state::map_rustnn_error)?],
+                OperandKind::Constant => {
+                    let bytes = self
+                        .constant_data_map
+                        .get(&(next_id as u32))
+                        .ok_or_else(|| {
+                            PyValueError::new_err(format!(
+                                "Missing constant bytes for operand {next_id}"
+                            ))
+                        })?;
+                    vec![builder
+                        .constant_from_bytes(&descriptor, bytes.data.clone())
+                        .map_err(super::context_state::map_rustnn_error)?]
+                }
+                _ => {
+                    let operation = operations.next().ok_or_else(|| {
+                        PyValueError::new_err(format!("Missing operation for operand {next_id}"))
+                    })?;
+                    let ids = super::recorded_builder::record_operation(&mut builder, operation)
+                        .map_err(|e| super::context_state::map_rustnn_error(e.into()))?;
+                    if ids
+                        .iter()
+                        .map(|operand| operand.rustnn_index())
+                        .collect::<Vec<_>>()
+                        != operation.output_operands()
+                    {
+                        return Err(PyValueError::new_err(
+                            "RustNN replay changed operation output IDs",
+                        ));
+                    }
+                    ids
+                }
+            };
+            if ids.is_empty() || ids[0].rustnn_index() as usize != next_id {
+                return Err(PyValueError::new_err("RustNN replay changed operand order"));
+            }
+            for id in &ids {
+                let expected = &self.operands[id.rustnn_index() as usize].descriptor;
+                let actual = builder
+                    .rustnn_operand_shape(*id)
+                    .map_err(super::context_state::map_rustnn_error)?;
+                if actual
+                    != expected
+                        .static_or_max_shape()
+                        .into_iter()
+                        .map(u64::from)
+                        .collect::<Vec<_>>()
+                {
+                    return Err(PyValueError::new_err(format!(
+                        "RustNN replay shape mismatch for operand {}: {actual:?}",
+                        id.rustnn_index()
+                    )));
+                }
+            }
+            next_id += ids.len();
+        }
+        if operations.next().is_some() {
+            return Err(PyValueError::new_err(
+                "Unrecorded operations remain after RustNN replay",
+            ));
+        }
+        Ok(builder)
+    }
+
     #[inline]
     pub(crate) fn push_op(&mut self, op: Operation) {
         self.operations.push(op);
@@ -4207,7 +4377,7 @@ impl PyMLGraphBuilder {
     /// Create a new graph builder tied to a context (internal).
     pub(crate) fn new_for_context(context: Py<super::context::PyMLContext>) -> Self {
         Self {
-            context,
+            context: Some(context),
             built: false,
             operands: Vec::new(),
             operations: Vec::new(),

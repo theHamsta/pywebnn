@@ -13,7 +13,7 @@ crate-type = ["cdylib", "rlib"]
 name = "pywebnn"
 
 [features]
-default = ["onnx-runtime", "dynamic-inputs"]
+default = ["trtx-runtime", "onnx-runtime", "dynamic-inputs"]
 onnx-runtime = ["rustnn/onnx-runtime", "ort", "ndarray"]
 coreml-runtime = ["rustnn/coreml-runtime"]
 trtx-runtime = ["rustnn/trtx-runtime"]

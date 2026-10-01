@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Dict, List, Optional
+from os import PathLike
 
 import numpy as np
 import numpy.typing as npt
@@ -74,6 +75,10 @@ class MLOperand:
 
 
 class MLGraphBuilder:
+    @staticmethod
+    def new_uncompiled() -> MLGraphBuilder: ...
+    def rustnn_webnn_text_for_outputs(self, outputs: Dict[str, MLOperand]) -> str: ...
+    def rustnn_save_webnn(self, outputs: Dict[str, MLOperand], path: str | PathLike[str]) -> None: ...
     def __init__(self) -> None: ...
 
     def build(self, outputs): ...

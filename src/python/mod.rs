@@ -5,6 +5,7 @@ mod context_state;
 mod graph;
 mod graph_builder;
 mod operand;
+mod recorded_builder;
 mod tensor;
 
 pub use context::{PyML, PyMLContext};
